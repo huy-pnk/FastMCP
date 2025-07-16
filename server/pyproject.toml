@@ -1,0 +1,10 @@
+[project]
+name = "fastmcp-server"
+version = "0.1.0"
+description = "FastMCP server"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.10.5",
+]
+
+[tool.uv]
