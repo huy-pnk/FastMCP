@@ -35,11 +35,11 @@ A simple [FastMCP](https://gofastmcp.com/) server that provides a dice-rolling t
 ## Usage
 ### Run the server (HTTP transport)
 ```sh
-fastmcp run ./src/main.py --transport http --host 127.0.0.1 --port 8082
+fastmcp run ./app/main.py --transport http --host 127.0.0.1 --port 8082
 ```
 Or, run directly with Python (uses HTTP transport as set in code):
 ```sh
-python ./src/main.py
+python ./app/main.py
 ```
 
 ### Example: Roll Dice Tool

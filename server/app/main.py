@@ -1,134 +1,154 @@
 import asyncio
-import json
-import logging
-from typing import Any, Dict, List, Optional
 import aiohttp
+import json
+import os
+import time
+import sys
+from typing import Dict, Any, Optional
 from fastmcp import FastMCP
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Initialize FastMCP
-mcp = FastMCP("helpdesk-tool")
+mcp = FastMCP("helpdesk-file-jwt")
 
 # Configuration
-HELPDESK_BASE_URL = "http://localhost:8081"
-CURRENT_TOKEN = None
-CURRENT_USER = None
+HELPDESK_API_URL = "http://localhost:8081"
+KEYCLOAK_BASE_URL = "http://localhost:9000"
+KEYCLOAK_REALM = "oauth-demo"
+JWT_FILE_PATH = r"C:\Project\GitHub\Ubuntu\MCP\oauth\saved_jwt.json"
 
-class HelpdeskAPI:
-    def __init__(self, base_url: str):
-        self.base_url = base_url
-        self.token = None
-        self.session = None
+def read_jwt_file() -> Optional[Dict[str, Any]]:
+    """
+    Read JWT data from saved file
     
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-    
-    def set_token(self, token: str):
-        self.token = token
-    
-    def get_headers(self):
-        headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        return headers
-    
-    async def make_request(self, method: str, endpoint: str, data: Optional[Dict] = None):
-        url = f"{self.base_url}{endpoint}"
-        headers = self.get_headers()
+    Returns:
+        Dict with JWT data or None if file doesn't exist/invalid
+    """
+    try:
+        if not os.path.exists(JWT_FILE_PATH):
+            return None
+            
+        with open(JWT_FILE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        # Validate required fields
+        required_fields = ['access_token', 'expires_at']
+        if not all(field in data for field in required_fields):
+            return None
+            
+        return data
         
-        try:
-            async with self.session.request(method, url, headers=headers, json=data) as response:
-                response_data = await response.json()
-                if response.status >= 400:
-                    raise Exception(f"API Error {response.status}: {response_data.get('detail', 'Unknown error')}")
-                return response_data
-        except aiohttp.ClientError as e:
-            raise Exception(f"Connection error: {str(e)}")
+    except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
+        print(f"Error reading JWT file: {e}", file=sys.stderr)
+        return None
 
-# Initialize API client
-api = HelpdeskAPI(HELPDESK_BASE_URL)
-
-@mcp.tool()
-async def helpdesk_register(username: str, email: str, password: str, role: str = "user") -> Dict[str, Any]:
+def is_token_valid(jwt_data: Dict[str, Any]) -> tuple[bool, str]:
     """
-    Register a new user in the helpdesk system
+    Check if JWT token is still valid
     
     Args:
-        username: Unique username
-        email: User's email address
-        password: User's password
-        role: User role (user, agent, admin) - default: user
+        jwt_data: JWT data from file
+        
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    if not jwt_data:
+        return False, "No JWT data provided"
+    
+    access_token = jwt_data.get('access_token')
+    if not access_token:
+        return False, "No access token found"
+    
+    expires_at = jwt_data.get('expires_at')
+    if not expires_at:
+        return False, "No expiry information found"
+    
+    current_time = int(time.time())
+    if current_time >= expires_at:
+        expires_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(expires_at))
+        return False, f"Token expired at {expires_str}"
+    
+    return True, "Token is valid"
+
+def get_valid_token() -> tuple[Optional[str], str]:
+    """
+    Get valid JWT token from file
     
     Returns:
-        Dict containing user information
+        Tuple of (token, status_message)
     """
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            user_data = {
-                "username": username,
-                "email": email,
-                "password": password,
-                "role": role
-            }
-            
-            result = await client.make_request("POST", "/register", user_data)
-            return {
-                "success": True,
-                "message": "User registered successfully",
-                "user": result
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+    jwt_data = read_jwt_file()
+    
+    if not jwt_data:
+        return None, f"❌ JWT file not found or invalid.\n📂 Expected location: {JWT_FILE_PATH}\n💡 Please open oauth_test_page.html and complete login."
+    
+    is_valid, reason = is_token_valid(jwt_data)
+    
+    if not is_valid:
+        return None, f"❌ JWT token invalid: {reason}\n💡 Please login again using oauth_test_page.html"
+    
+    user_info = jwt_data.get('user_info', {})
+    username = user_info.get('preferred_username', 'Unknown')
+    
+    return jwt_data['access_token'], f"✅ Valid JWT found for user: {username}"
 
 @mcp.tool()
-async def helpdesk_login(username: str, password: str) -> Dict[str, Any]:
+async def helpdesk_check_auth_status() -> Dict[str, Any]:
     """
-    Login to the helpdesk system and get access token
-    
-    Args:
-        username: Username
-        password: Password
+    Check authentication status by reading JWT file
     
     Returns:
-        Dict containing login status and token
+        Dict with detailed authentication status
     """
-    global CURRENT_TOKEN, CURRENT_USER
+    jwt_data = read_jwt_file()
     
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            login_data = {
-                "username": username,
-                "password": password
-            }
-            
-            result = await client.make_request("POST", "/login", login_data)
-            
-            # Store token for future requests
-            CURRENT_TOKEN = result["access_token"]
-            CURRENT_USER = username
-            
-            return {
-                "success": True,
-                "message": "Login successful",
-                "token": result["access_token"],
-                "user": username
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+    if not jwt_data:
+        return {
+            "success": False,
+            "authenticated": False,
+            "error": "JWT file not found",
+            "file_path": JWT_FILE_PATH,
+            "instructions": [
+                "1. Open oauth_test_page.html in your browser",
+                "2. Complete OAuth2 login with Keycloak", 
+                "3. Save JWT to file",
+                "4. Try again"
+            ]
+        }
+    
+    is_valid, reason = is_token_valid(jwt_data)
+    user_info = jwt_data.get('user_info', {})
+    
+    status = {
+        "success": True,
+        "authenticated": is_valid,
+        "file_exists": True,
+        "file_path": JWT_FILE_PATH,
+        "token_valid": is_valid,
+        "validation_reason": reason,
+        "user_info": {
+            "username": user_info.get('preferred_username'),
+            "email": user_info.get('email'),
+            "name": user_info.get('name')
+        },
+        "token_info": {
+            "expires_at": jwt_data.get('expires_at'),
+            "expires_at_readable": time.strftime('%Y-%m-%d %H:%M:%S', 
+                                                time.localtime(jwt_data.get('expires_at', 0))),
+            "issued_at": jwt_data.get('issued_at'),
+            "time_until_expiry": max(0, jwt_data.get('expires_at', 0) - int(time.time())),
+        },
+        "keycloak_config": jwt_data.get('keycloak_config', {})
+    }
+    
+    if not is_valid:
+        status["instructions"] = [
+            "Token is invalid or expired",
+            "Please login again:",
+            "1. Open oauth_test_page.html", 
+            "2. Complete OAuth2 flow",
+            "3. Save new JWT to file"
+        ]
+    
+    return status
 
 @mcp.tool()
 async def helpdesk_create_ticket(title: str, description: str, priority: str = "medium") -> Dict[str, Any]:
@@ -138,20 +158,29 @@ async def helpdesk_create_ticket(title: str, description: str, priority: str = "
     Args:
         title: Ticket title
         description: Detailed description of the issue
-        priority: Priority level (low, medium, high, urgent) - default: medium
+        priority: Priority level (low, medium, high, urgent)
     
     Returns:
         Dict containing ticket information
     """
-    if not CURRENT_TOKEN:
+    # Check authentication
+    token, auth_message = get_valid_token()
+    
+    if not token:
         return {
             "success": False,
-            "error": "Not logged in. Please login first using helpdesk_login."
+            "error": "Authentication required",
+            "message": auth_message,
+            "suggestion": "Use helpdesk_check_auth_status() for more details"
         }
     
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            client.set_token(CURRENT_TOKEN)
+    # Create ticket
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
             
             ticket_data = {
                 "title": title,
@@ -159,250 +188,190 @@ async def helpdesk_create_ticket(title: str, description: str, priority: str = "
                 "priority": priority
             }
             
-            result = await client.make_request("POST", "/tickets", ticket_data)
-            return {
-                "success": True,
-                "message": "Ticket created successfully",
-                "ticket": result
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            async with session.post(f"{HELPDESK_API_URL}/tickets", 
+                                  headers=headers, 
+                                  json=ticket_data) as response:
+                
+                if response.status in [200, 201]:
+                    result = await response.json()
+                    return {
+                        "success": True,
+                        "message": "🎫 Ticket created successfully!",
+                        "ticket": result,
+                        "auth_status": auth_message
+                    }
+                elif response.status == 401:
+                    return {
+                        "success": False,
+                        "error": "Authentication failed",
+                        "message": "JWT token was rejected by the API. Please login again.",
+                        "suggestion": "Open oauth_test_page.html and complete login"
+                    }
+                else:
+                    error_data = await response.text()
+                    return {
+                        "success": False,
+                        "error": f"API error: HTTP {response.status}",
+                        "details": error_data
+                    }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Connection error: {str(e)}",
+            "suggestion": "Check if FastAPI helpdesk server is running on port 8081"
+        }
 
 @mcp.tool()
 async def helpdesk_get_tickets() -> Dict[str, Any]:
     """
-    Get all tickets accessible to the current user
+    Get all tickets accessible to current user
     
     Returns:
         Dict containing list of tickets
     """
-    if not CURRENT_TOKEN:
+    # Check authentication
+    token, auth_message = get_valid_token()
+    
+    if not token:
         return {
             "success": False,
-            "error": "Not logged in. Please login first using helpdesk_login."
+            "error": "Authentication required",
+            "message": auth_message,
+            "suggestion": "Use helpdesk_check_auth_status() for more details"
         }
     
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            client.set_token(CURRENT_TOKEN)
-            
-            result = await client.make_request("GET", "/tickets")
-            return {
-                "success": True,
-                "tickets": result,
-                "count": len(result)
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-@mcp.tool()
-async def helpdesk_get_ticket(ticket_id: str) -> Dict[str, Any]:
-    """
-    Get details of a specific ticket
-    
-    Args:
-        ticket_id: ID of the ticket to retrieve
-    
-    Returns:
-        Dict containing ticket details
-    """
-    if not CURRENT_TOKEN:
-        return {
-            "success": False,
-            "error": "Not logged in. Please login first using helpdesk_login."
-        }
-    
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            client.set_token(CURRENT_TOKEN)
-            
-            result = await client.make_request("GET", f"/tickets/{ticket_id}")
-            return {
-                "success": True,
-                "ticket": result
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-@mcp.tool()
-async def helpdesk_update_ticket(ticket_id: str, title: str = None, description: str = None, 
-                                status: str = None, priority: str = None, assigned_to: str = None) -> Dict[str, Any]:
-    """
-    Update an existing ticket
-    
-    Args:
-        ticket_id: ID of the ticket to update
-        title: New title (optional)
-        description: New description (optional)
-        status: New status (open, in_progress, resolved, closed) (optional)
-        priority: New priority (low, medium, high, urgent) (optional)
-        assigned_to: Assign to user (optional)
-    
-    Returns:
-        Dict containing updated ticket information
-    """
-    if not CURRENT_TOKEN:
-        return {
-            "success": False,
-            "error": "Not logged in. Please login first using helpdesk_login."
-        }
-    
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            client.set_token(CURRENT_TOKEN)
-            
-            update_data = {}
-            if title is not None:
-                update_data["title"] = title
-            if description is not None:
-                update_data["description"] = description
-            if status is not None:
-                update_data["status"] = status
-            if priority is not None:
-                update_data["priority"] = priority
-            if assigned_to is not None:
-                update_data["assigned_to"] = assigned_to
-            
-            if not update_data:
-                return {
-                    "success": False,
-                    "error": "No update data provided"
-                }
-            
-            result = await client.make_request("PUT", f"/tickets/{ticket_id}", update_data)
-            return {
-                "success": True,
-                "message": "Ticket updated successfully",
-                "ticket": result
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-@mcp.tool()
-async def helpdesk_get_stats() -> Dict[str, Any]:
-    """
-    Get helpdesk statistics (requires agent or admin role)
-    
-    Returns:
-        Dict containing system statistics
-    """
-    if not CURRENT_TOKEN:
-        return {
-            "success": False,
-            "error": "Not logged in. Please login first using helpdesk_login."
-        }
-    
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            client.set_token(CURRENT_TOKEN)
-            
-            result = await client.make_request("GET", "/stats")
-            return {
-                "success": True,
-                "stats": result
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-@mcp.tool()
-async def helpdesk_get_current_user() -> Dict[str, Any]:
-    """
-    Get current logged-in user information
-    
-    Returns:
-        Dict containing user information
-    """
-    if not CURRENT_TOKEN:
-        return {
-            "success": False,
-            "error": "Not logged in. Please login first using helpdesk_login."
-        }
-    
-    async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-        try:
-            client.set_token(CURRENT_TOKEN)
-            
-            result = await client.make_request("GET", "/users/me")
-            return {
-                "success": True,
-                "user": result
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-@mcp.tool()
-async def helpdesk_logout() -> Dict[str, Any]:
-    """
-    Logout from the helpdesk system
-    
-    Returns:
-        Dict containing logout status
-    """
-    global CURRENT_TOKEN, CURRENT_USER
-    
-    CURRENT_TOKEN = None
-    CURRENT_USER = None
-    
-    return {
-        "success": True,
-        "message": "Logged out successfully"
-    }
-
-@mcp.tool()
-async def helpdesk_status() -> Dict[str, Any]:
-    """
-    Check connection status and current user
-    
-    Returns:
-        Dict containing connection and user status
-    """
+    # Get tickets
     try:
-        async with HelpdeskAPI(HELPDESK_BASE_URL) as client:
-            # Test connection
-            await client.make_request("GET", "/")
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {token}"}
             
-            return {
-                "success": True,
-                "connection": "Connected",
-                "base_url": HELPDESK_BASE_URL,
-                "logged_in": CURRENT_TOKEN is not None,
-                "current_user": CURRENT_USER
-            }
+            async with session.get(f"{HELPDESK_API_URL}/tickets", headers=headers) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return {
+                        "success": True,
+                        "message": f"📋 Found {len(result) if isinstance(result, list) else 0} tickets",
+                        "tickets": result,
+                        "count": len(result) if isinstance(result, list) else 0,
+                        "auth_status": auth_message
+                    }
+                elif response.status == 401:
+                    return {
+                        "success": False,
+                        "error": "Authentication failed",
+                        "message": "JWT token was rejected by the API. Please login again.",
+                        "suggestion": "Open oauth_test_page.html and complete login"
+                    }
+                else:
+                    error_data = await response.text()
+                    return {
+                        "success": False,
+                        "error": f"API error: HTTP {response.status}",
+                        "details": error_data
+                    }
+    
     except Exception as e:
         return {
             "success": False,
-            "connection": "Failed",
-            "error": str(e)
+            "error": f"Connection error: {str(e)}",
+            "suggestion": "Check if FastAPI helpdesk server is running on port 8081"
         }
 
-if __name__ == "__main__":
-    import sys
+@mcp.tool()
+async def helpdesk_get_user_info() -> Dict[str, Any]:
+    """
+    Get current user information
     
-    # Run the MCP server
-    print("Starting IT Helpdesk MCP Tool...", file=sys.stderr)
-    mcp.run()
-    # mcp.run(
-    #     #transport="std",
-    #     host="127.0.0.1",
-    #     port=8081,
-    #     path="/",
-    #     log_level="debug",
-    # )
+    Returns:
+        Dict with user information
+    """
+    # Check authentication
+    token, auth_message = get_valid_token()
+    
+    if not token:
+        return {
+            "success": False,
+            "error": "Authentication required",
+            "message": auth_message
+        }
+    
+    jwt_data = read_jwt_file()
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {token}"}
+            
+            # Get user info from API
+            api_user_info = {}
+            async with session.get(f"{HELPDESK_API_URL}/users/me", headers=headers) as response:
+                if response.status == 200:
+                    api_user_info = await response.json()
+            
+            # Get user info from Keycloak
+            keycloak_user_info = {}
+            userinfo_url = f"{KEYCLOAK_BASE_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/userinfo"
+            async with session.get(userinfo_url, headers=headers) as response:
+                if response.status == 200:
+                    keycloak_user_info = await response.json()
+            
+            return {
+                "success": True,
+                "jwt_file_info": jwt_data.get('user_info', {}),
+                "api_user_info": api_user_info,
+                "keycloak_user_info": keycloak_user_info,
+                "auth_status": auth_message
+            }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Connection error: {str(e)}"
+        }
+
+@mcp.tool()
+async def helpdesk_refresh_instructions() -> Dict[str, Any]:
+    """
+    Get instructions for refreshing authentication
+    
+    Returns:
+        Dict with step-by-step instructions
+    """
+    return {
+        "success": True,
+        "title": "🔄 How to Refresh Authentication",
+        "instructions": [
+            "1. 🌐 Open your browser",
+            f"2. 📁 Navigate to: C:\\Project\\GitHub\\Ubuntu\\MCP\\oauth\\oauth_test_page.html",
+            "3. 🔐 Click 'Login with Keycloak'",
+            "4. 👤 Enter your credentials (testuser/password123)",
+            "5. 🔄 Click 'Exchange Code for Token'",
+            "6. 💾 Click 'Save JWT to File'",
+            "7. 📂 Move downloaded file to:",
+            f"   {JWT_FILE_PATH}",
+            "8. ✅ Use helpdesk_check_auth_status() to verify"
+        ],
+        "file_locations": {
+            "oauth_page": "C:\\Project\\GitHub\\Ubuntu\\MCP\\oauth\\oauth_test_page.html",
+            "jwt_file": JWT_FILE_PATH
+        },
+        "test_credentials": {
+            "username": "testuser",
+            "password": "password123"
+        },
+        "troubleshooting": [
+            "• If Keycloak is not running: docker run -p 9000:8080 keycloak...",
+            "• If FastAPI is not running: python main.py",
+            "• If file permissions: Run as administrator",
+            "• If browser issues: Try incognito/private mode"
+        ]
+    }
+
+if __name__ == "__main__":
+    print(f"🚀 Starting Helpdesk MCP Server with stdio transport...", file=sys.stderr)
+    print(f"📁 JWT File Path: {JWT_FILE_PATH}", file=sys.stderr)
+    print(f"🌐 FastAPI URL: {HELPDESK_API_URL}", file=sys.stderr)
+    print(f"🔐 Keycloak URL: {KEYCLOAK_BASE_URL}", file=sys.stderr)
+    
+    # Use stdio transport instead of HTTP
+    mcp.run()  # This defaults to stdio transport
